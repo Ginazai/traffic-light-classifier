@@ -1,0 +1,24 @@
+{
+  "input_shape": [
+    96,
+    96,
+    3
+  ],
+  "classes": [
+    "red",
+    "yellow",
+    "green"
+  ],
+  "class_to_idx": {
+    "red": 0,
+    "yellow": 1,
+    "green": 2
+  },
+  "idx_to_class": {
+    "0": "red",
+    "1": "yellow",
+    "2": "green"
+  },
+  "test_accuracy": 0.9333333373069763,
+  "model_size_kb": 861.6171875
+}
