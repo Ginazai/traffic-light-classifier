@@ -2,20 +2,23 @@
   "input_shape": [
     96,
     96,
-    2
+    3
   ],
   "classes": [
     "red",
+    "yellow",
     "green"
   ],
   "class_to_idx": {
     "red": 0,
-    "green": 1
+    "yellow": 1,
+    "green": 2
   },
   "idx_to_class": {
     "0": "red",
-    "1": "green"
+    "1": "yellow",
+    "2": "green"
   },
-  "test_accuracy": 0.9616666436195374,
-  "model_size_kb": 861.36328125
+  "test_accuracy": 0.9377777576446533,
+  "model_size_kb": 861.6171875
 }

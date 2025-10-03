@@ -31,7 +31,8 @@ CONFIG = {
     'batch_size': 16,
     'epochs': 80,
     'learning_rate': 0.0003,
-    'classes': ['red', 'yellow', 'green'],
+    #'classes': ['red', 'yellow', 'green'],
+    'classes': ['red', 'green'],
     'model_name': 'traffic_light_classifier',
     'data_dir': 'lisa_dataset',
     'output_dir': 'output_models'
@@ -136,10 +137,19 @@ class LISADatasetProcessor:
                     # Map LISA labels to our classes
                     annotation_tag = row['Annotation tag'] if 'Annotation tag' in df.columns else row.get('Annotation_tag', '')
                     
+                    #if annotation_tag in ['stop', 'stopLeft']:
+                    #    label = 'red'
+                    #elif annotation_tag in ['warning', 'warningLeft']:
+                    #    label = 'yellow'
+                    #elif annotation_tag in ['go', 'goLeft', 'goForward']:
+                    #    label = 'green'
+                    #else:
+                    #    continue
+
                     if annotation_tag in ['stop', 'stopLeft']:
                         label = 'red'
-                    elif annotation_tag in ['warning', 'warningLeft']:
-                        label = 'yellow'
+                    #elif annotation_tag in ['warning', 'warningLeft']:
+                    #    label = 'yellow'
                     elif annotation_tag in ['go', 'goLeft', 'goForward']:
                         label = 'green'
                     else:
@@ -196,7 +206,8 @@ class LISADatasetProcessor:
         print(f"Original annotations: {len(self.annotations)}")
 
         # Count class distribution
-        class_counts = {'red': 0, 'yellow': 0, 'green': 0}
+        #class_counts = {'red': 0, 'yellow': 0, 'green': 0}
+        class_counts = {'red': 0, 'green': 0}
         for annotation in self.annotations:
             label = annotation['label']
             if label in class_counts:
@@ -208,9 +219,9 @@ class LISADatasetProcessor:
 
         # Target samples per class
         target_per_class = {
-            'red': 4000,
-            'yellow': 4000,
-            'green': 4000
+            'red': 6000,
+            #'yellow': 4000,
+            'green': 6000
         }
 
         # Group by image to avoid duplicates
@@ -229,16 +240,18 @@ class LISADatasetProcessor:
 
         # Sample images by dominant class
         sampled_images = []
-        class_sampled = {'red': 0, 'yellow': 0, 'green': 0}
-
+        #class_sampled = {'red': 0, 'yellow': 0, 'green': 0}
+        class_sampled = {'red': 0, 'green': 0}
         # Calculate how many unique images per class exist
-        image_class_counts = {'red': 0, 'yellow': 0, 'green': 0}
+        #image_class_counts = {'red': 0, 'yellow': 0, 'green': 0}
+        image_class_counts = {'red': 0, 'green': 0}
         for annotations_list in image_to_annotations.values():
-            class_counter = {'red': 0, 'yellow': 0, 'green': 0}
-            if class_sampled['yellow'] < target_per_class['yellow']:
-                yellow_shortfall = target_per_class['yellow'] - class_sampled['yellow']
-                print(f"Yellow shortfall: {yellow_shortfall}, adding more yellow samples...")
-    
+            #class_counter = {'red': 0, 'yellow': 0, 'green': 0}
+            class_counter = {'red': 0, 'green': 0}
+            #if class_sampled['yellow'] < target_per_class['yellow']:
+            #    yellow_shortfall = target_per_class['yellow'] - class_sampled['yellow']
+            #    print(f"Yellow shortfall: {yellow_shortfall}, adding more yellow samples...")
+            if False:
                 # Go through ALL yellow images again
                 for image_key, annotations_list in image_to_annotations.items():
                     class_counter = {'red': 0, 'yellow': 0, 'green': 0}
@@ -269,7 +282,8 @@ class LISADatasetProcessor:
 
         # Calculate sampling intervals
         sampling_intervals = {}
-        for cls in ['red', 'yellow', 'green']:
+        #for cls in ['red', 'yellow', 'green']:
+        for cls in ['red', 'green']:
             if image_class_counts[cls] > 0:
                 # If we have fewer images than target, take all (interval=1)
                 # Otherwise calculate interval to reach target
@@ -286,10 +300,11 @@ class LISADatasetProcessor:
             print(f"  {cls}: every {interval}th image → ~{expected} samples")
 
         # Sample images
-        class_counters = {'red': 0, 'yellow': 0, 'green': 0}
-
+        #class_counters = {'red': 0, 'yellow': 0, 'green': 0}
+        class_counters = {'red': 0, 'green': 0}
         for image_key, annotations_list in image_to_annotations.items():
-            class_counter = {'red': 0, 'yellow': 0, 'green': 0}
+            #class_counter = {'red': 0, 'yellow': 0, 'green': 0}
+            class_counter = {'red': 0, 'green': 0}
             for ann in annotations_list:
                 if ann['label'] in class_counter:
                     class_counter[ann['label']] += 1
@@ -318,9 +333,9 @@ class LISADatasetProcessor:
                 class_sampled[dominant_class] += 1
             
                 # ONLY duplicate yellow if we're still far from target
-                if dominant_class == 'yellow' and class_sampled['yellow'] < target_per_class['yellow']:
-                    sampled_images.append(best_annotation)
-                    class_sampled['yellow'] += 1
+                #if dominant_class == 'yellow' and class_sampled['yellow'] < target_per_class['yellow']:
+                #    sampled_images.append(best_annotation)
+                #    class_sampled['yellow'] += 1
 
         print(f"\nSampled {len(sampled_images)} images total")
         print("Samples per class:")
@@ -330,12 +345,13 @@ class LISADatasetProcessor:
         # Extract center crops
         counters = {
             'successful_extractions': 0,
-            'successful_by_class': {'red': 0, 'yellow': 0, 'green': 0}
+            #'successful_by_class': {'red': 0, 'yellow': 0, 'green': 0}
+            'successful_by_class': {'red': 0, 'green': 0}
         }
 
         for i, annotation in enumerate(sampled_images):
             if i % 100 == 0 and i > 0:
-                print(f"Progress: {i}/{len(sampled_images)}")
+                print(f"Progress ({i}/{len(sampled_images)}):\n{i / len(sampled_images)*100:.1f}%")
     
             sequence = annotation.get('sequence', 'dayTrain')
             clip_name = annotation.get('clip', None)
@@ -907,7 +923,7 @@ class TrafficLightModel:
         )
         
         # Freeze base model layers
-        base_model.trainable = False
+        base_model.trainable = True
         
         # Add custom classification head
         model = keras.Sequential([
@@ -994,7 +1010,7 @@ class TrafficLightModel:
             # shear_range=0.02,            # Very small shear
         
             # Photometric augmentations (more important for traffic lights)
-            brightness_range=[0.8, 1.2], # More aggressive brightness variation
+            brightness_range=[0.6, 1.4], # More aggressive brightness variation
             channel_shift_range=10,       # Color channel variations
         
             # No flipping for traffic lights
@@ -1061,7 +1077,8 @@ class TrafficLightModel:
         print("Setting up manual class mapping (no LabelEncoder)...")
 
         # Manual class mapping with YOUR desired order
-        desired_classes = ['red', 'yellow', 'green']  # Your desired order
+        #desired_classes = ['red', 'yellow', 'green']  # Your desired order
+        desired_classes = ['red','green']  # Your desired order
         class_to_idx = {cls: idx for idx, cls in enumerate(desired_classes)}
         idx_to_class = {idx: cls for idx, cls in enumerate(desired_classes)}
 
@@ -1107,9 +1124,19 @@ class TrafficLightModel:
 
         class_weights = dict(enumerate(class_weights_array))
 
-        class_weights[0] *= 3.0   # red (HEAVY - it's failing badly)
-        class_weights[1] *= 2.0   # yellow (moderate boost)
-        class_weights[2] *= 0.7   # green (reduce - it's overconfident)
+        class_weights[0] *= 2.5  # red - heavily penalize misses
+        #class_weights[1] *= 4.0  # yellow - most confused class needs highest weight
+        class_weights[1] *= 2.25  # green - increase from 1.0
+
+        # For 95% accuracy with HVS changes
+        # class_weights[0] *= 3.0
+        # class_weights[1] *= 2.0 
+        # class_weights[2] *= 1.0  
+
+        # weights for 92% accuracy with no HVS and simple CNN
+        #class_weights[0] *= 2.0   # red - increase (75% recall too low)
+        #class_weights[1] *= 1.8   # yellow - slight reduce (93% is good but causing 58 red confusions)
+        #class_weights[2] *= 2.2   # green - slight reduce (99% recall is overfit)
     
         print(f"Moderate class weights: {class_weights}")
     
@@ -1125,9 +1152,16 @@ class TrafficLightModel:
         )
     
         # Compile with label smoothing to prevent overconfidence
+        #self.model.compile(
+        #    optimizer=optimizer,
+        #    loss=keras.losses.CategoricalCrossentropy(label_smoothing=0.1),  # Label smoothing
+        #    metrics=['accuracy']
+        #)
+        # Replace your loss with focal loss
+        #import tensorflow_addons as tfa
         self.model.compile(
             optimizer=optimizer,
-            loss=keras.losses.CategoricalCrossentropy(label_smoothing=0.1),  # Label smoothing
+            loss=keras.losses.BinaryCrossentropy(),
             metrics=['accuracy']
         )
     
@@ -1309,23 +1343,36 @@ def preprocess_images(images):
     
     for img in images:
         # Convert to HSV
-        img_hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV).astype(np.float32)
+        #img_hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV).astype(np.float32)
         
         # AGGRESSIVE saturation boost
-        img_hsv[:, :, 1] = np.clip(img_hsv[:, :, 1] * 2.0, 0, 255)  # 2.0x not 1.8x
+        #img_hsv[:, :, 1] = np.clip(img_hsv[:, :, 1] * 1.8, 0, 255)  # 2.0x not 1.8x
         
         # Value enhancement
-        img_hsv[:, :, 2] = np.clip(img_hsv[:, :, 2] * 1.2, 0, 255)
+        #img_hsv[:, :, 2] = np.clip(img_hsv[:, :, 2] * 1.2, 0, 255)
         
-        img_enhanced = cv2.cvtColor(img_hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+        #img_enhanced = cv2.cvtColor(img_hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
         
         # RED-SPECIFIC boost
         # Find red-ish pixels and enhance them
-        red_mask = (img_enhanced[:,:,0] > 100) & (img_enhanced[:,:,0] > img_enhanced[:,:,1] * 1.2)
-        img_enhanced[:,:,0][red_mask] = np.clip(img_enhanced[:,:,0][red_mask] * 1.3, 0, 255)
+        #red_mask = (img_enhanced[:,:,0] > 100) & (img_enhanced[:,:,0] > img_enhanced[:,:,1] * 1.2)
+        #img_enhanced[:,:,0][red_mask] = np.clip(img_enhanced[:,:,0][red_mask] * 1.3, 0, 255)
         
         # Contrast
-        img_enhanced = np.clip(img_enhanced * 1.15, 0, 255).astype(np.uint8)
+        #img_enhanced = np.clip(img_enhanced * 1.15, 0, 255).astype(np.uint8)
+        
+        #processed_images.append(img_enhanced)
+        #alternative
+        # Convert to HSV
+        img_hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV).astype(np.float32)
+        
+        # Aggressive saturation boost for color separation
+        img_hsv[:, :, 1] = np.clip(img_hsv[:, :, 1] * 1.05, 0, 255)
+        
+        # Value enhancement
+        img_hsv[:, :, 2] = np.clip(img_hsv[:, :, 2] * 1.05, 0, 255)
+        
+        img_enhanced = cv2.cvtColor(img_hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
         
         processed_images.append(img_enhanced)
     
@@ -1407,11 +1454,19 @@ def main():
         pickle.dump(model.label_encoder, f)
     # print(f"Label encoder classes: {model.label_encoder.classes_}")
     # Save model info
+    #model_info = {
+    #    'input_shape': CONFIG['img_size'] + (3,),
+    #    'classes': ['red', 'yellow', 'green'],  # Your desired order
+    #     'class_to_idx': {'red': 0, 'yellow': 1, 'green': 2},
+    #   'idx_to_class': {0: 'red', 1: 'yellow', 2: 'green'},
+    #    'test_accuracy': float(test_accuracy),
+    #    'model_size_kb': len(tflite_model) / 1024
+    #}
     model_info = {
-        'input_shape': CONFIG['img_size'] + (3,),
-        'classes': ['red', 'yellow', 'green'],  # Your desired order
-        'class_to_idx': {'red': 0, 'yellow': 1, 'green': 2},
-        'idx_to_class': {0: 'red', 1: 'yellow', 2: 'green'},
+        'input_shape': CONFIG['img_size'] + (2,),
+        'classes': ['red','green'],  # Your desired order
+        'class_to_idx': {'red': 0, 'green': 1},
+        'idx_to_class': {0: 'red', 1: 'green'},
         'test_accuracy': float(test_accuracy),
         'model_size_kb': len(tflite_model) / 1024
     }
