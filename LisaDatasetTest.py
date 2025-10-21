@@ -1,11 +1,7 @@
 ﻿"""
-Traffic Light Color Classification Model for ESP32-S3
-Using LISA Traffic Light Dataset with TensorFlow Lite
-
-This script creates a lightweight model to classify traffic light colors:
-- Red, Yellow, Green
-- Optimized for ESP32-S3 deployment
-- Uses MobileNetV2 as base for efficiency
+Traffic Light Detection and Classification Pipeline for ESP32-S3
+Two-stage approach: Detection (localize traffic lights) → Classification (identify color)
+Using LISA Traffic Light Dataset with bounding boxes for detection
 """
 
 import os
@@ -20,37 +16,34 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 import matplotlib.pyplot as plt
 from pathlib import Path
-import zipfile
-import requests
-from PIL import Image
 import json
 
 # Configuration
 CONFIG = {
-    'img_size': (96, 96), 
+    'img_size': (96, 96),
+    'detection_img_size': (224, 224),  # Larger for detection
     'batch_size': 16,
     'epochs': 80,
     'learning_rate': 0.0003,
-    #'classes': ['red', 'yellow', 'green'],
     'classes': ['red', 'green'],
     'model_name': 'traffic_light_classifier',
+    'detection_model_name': 'traffic_light_detector',
     'data_dir': 'lisa_dataset',
     'output_dir': 'output_models'
 }
 
 class LISADatasetProcessor:
-    """Process LISA Traffic Light Dataset"""
+    """Process LISA Traffic Light Dataset for both detection and classification"""
     
     def __init__(self, data_dir):
         self.data_dir = Path(data_dir)
         self.annotations = []
         self.images = []
         self.labels = []
-    
+        self.bboxes = []  # Store bounding boxes for detection
+        
     def load_real_lisa_data(self, lisa_path):
-        """
-        Load real LISA dataset - IMPROVED VERSION that processes ALL sequences
-        """
+        """Load real LISA dataset"""
         if not os.path.exists(lisa_path):
             print(f"LISA dataset not found at {lisa_path}")
             return False
@@ -64,7 +57,6 @@ class LISADatasetProcessor:
             
         print(f"Loading LISA dataset from: {lisa_path}")
         
-        # Process ALL sequences (day and night)
         sequences = ['daySequence1', 'daySequence2', 'dayTrain', 
                     'nightSequence1', 'nightSequence2', 'nightTrain']
         
@@ -74,50 +66,36 @@ class LISADatasetProcessor:
             print(f"Processing {sequence}...")
             
             if sequence in ["dayTrain", "nightTrain"]:
-                # For training sequences, process multiple clips
                 clip_counter = 1
                 while True:
-                    if sequence == "dayTrain":
-                        clip_name = f'dayClip{clip_counter}'
-                    else:  # nightTrain
-                        clip_name = f'nightClip{clip_counter}'
-                    
+                    clip_name = f'dayClip{clip_counter}' if sequence == "dayTrain" else f'nightClip{clip_counter}'
                     annotation_dir = annotations_base / sequence / clip_name
                     
                     if not annotation_dir.exists():
-                        break  # No more clips
+                        break
                     
                     processed = self._process_sequence_annotations(
                         annotation_dir, images_base, sequence, clip_name
                     )
                     total_processed += processed
                     clip_counter += 1
-                    
             else:
-                # For regular sequences (daySequence1, daySequence2, etc.)
                 annotation_dir = annotations_base / sequence
-                
                 if annotation_dir.exists():
                     processed = self._process_sequence_annotations(
                         annotation_dir, images_base, sequence
                     )
                     total_processed += processed
-                else:
-                    print(f"  Warning: {sequence} not found")
         
         print(f"Total annotations loaded: {len(self.annotations)}")
-        print(f"Total images processed: {total_processed}")
         
-        # Process images and extract traffic light regions
         if len(self.annotations) > 0:
-            self._extract_center_crop_regions(images_base)
+            self._extract_detection_and_classification_data(images_base)
         
         return len(self.images) > 0
     
     def _process_sequence_annotations(self, annotation_dir, images_base, sequence_name, clip_name=None):
-        """Process annotations from a single sequence or clip"""
-        
-        # Look for CSV annotation file
+        """Process annotations from a sequence"""
         csv_files = list(annotation_dir.glob("frameAnnotationsBOX.csv"))
         
         if not csv_files:
@@ -128,53 +106,35 @@ class LISADatasetProcessor:
         
         for csv_file in csv_files:
             try:
-                # Read CSV with error handling
                 df = pd.read_csv(csv_file, delimiter=';', on_bad_lines='skip')
-                
                 print(f"  - CSV loaded: {len(df)} annotations from {csv_file.name}")
                 
                 for _, row in df.iterrows():
-                    # Map LISA labels to our classes
                     annotation_tag = row['Annotation tag'] if 'Annotation tag' in df.columns else row.get('Annotation_tag', '')
                     
-                    #if annotation_tag in ['stop', 'stopLeft']:
-                    #    label = 'red'
-                    #elif annotation_tag in ['warning', 'warningLeft']:
-                    #    label = 'yellow'
-                    #elif annotation_tag in ['go', 'goLeft', 'goForward']:
-                    #    label = 'green'
-                    #else:
-                    #    continue
-
                     if annotation_tag in ['stop', 'stopLeft']:
                         label = 'red'
-                    #elif annotation_tag in ['warning', 'warningLeft']:
-                    #    label = 'yellow'
                     elif annotation_tag in ['go', 'goLeft', 'goForward']:
                         label = 'green'
                     else:
                         continue
                     
-                    # Extract filename (handle different path formats)
                     filename = row['Filename'] if 'Filename' in df.columns else row.get('filename', '')
                     if '/' in filename:
                         filename = filename.split('/')[-1]
                     
-                    # Validate bounding box coordinates
                     try:
-                        x1 = float(row['Upper left corner X']) if 'Upper left corner X' in df.columns else float(row.get('Upper_left_X', 0))
-                        y1 = float(row['Upper left corner Y']) if 'Upper left corner Y' in df.columns else float(row.get('Upper_left_Y', 0))
-                        x2 = float(row['Lower right corner X']) if 'Lower right corner X' in df.columns else float(row.get('Lower_right_X', 0))
-                        y2 = float(row['Lower right corner Y']) if 'Lower right corner Y' in df.columns else float(row.get('Lower_right_Y', 0))
+                        x1 = float(row['Upper left corner X'] if 'Upper left corner X' in df.columns else row.get('Upper_left_X', 0))
+                        y1 = float(row['Upper left corner Y'] if 'Upper left corner Y' in df.columns else row.get('Upper_left_Y', 0))
+                        x2 = float(row['Lower right corner X'] if 'Lower right corner X' in df.columns else row.get('Lower_right_X', 0))
+                        y2 = float(row['Lower right corner Y'] if 'Lower right corner Y' in df.columns else row.get('Lower_right_Y', 0))
                         
-                        # Validate bbox
                         if x1 >= x2 or y1 >= y2:
                             continue
                             
                     except (ValueError, TypeError, KeyError):
                         continue
                     
-                    # Store annotation with sequence and clip info
                     annotation_data = {
                         'filename': filename,
                         'label': label,
@@ -199,14 +159,15 @@ class LISADatasetProcessor:
         print(f"  - Processed: {processed_count} annotations")
         return processed_count
 
-    def _extract_center_crop_regions(self, images_base):
-        """Extract center-cropped regions - matching ESP32 deployment approach"""
-
-        print("Extracting center-cropped regions (ESP32-style)...")
+    def _extract_detection_and_classification_data(self, images_base):
+        """
+        Extract data for YOLO-style detection (detects AND classifies in one shot)
+        YOLO simultaneously predicts bounding boxes and class labels
+        """
+        print("Extracting data for YOLO detection pipeline...")
         print(f"Original annotations: {len(self.annotations)}")
 
         # Count class distribution
-        #class_counts = {'red': 0, 'yellow': 0, 'green': 0}
         class_counts = {'red': 0, 'green': 0}
         for annotation in self.annotations:
             label = annotation['label']
@@ -218,11 +179,7 @@ class LISADatasetProcessor:
             print(f"  {cls}: {count:,}")
 
         # Target samples per class
-        target_per_class = {
-            'red': 6000,
-            #'yellow': 4000,
-            'green': 6000
-        }
+        target_per_class = {'red': 6000, 'green': 6000}
 
         # Group by image to avoid duplicates
         image_to_annotations = {}
@@ -231,43 +188,17 @@ class LISADatasetProcessor:
             clip_name = annotation.get('clip', '')
             filename = annotation['filename']
             image_key = f"{sequence}_{clip_name}_{filename}"
-    
+        
             if image_key not in image_to_annotations:
                 image_to_annotations[image_key] = []
             image_to_annotations[image_key].append(annotation)
 
         print(f"Unique images available: {len(image_to_annotations)}")
 
-        # Sample images by dominant class
-        sampled_images = []
-        #class_sampled = {'red': 0, 'yellow': 0, 'green': 0}
-        class_sampled = {'red': 0, 'green': 0}
-        # Calculate how many unique images per class exist
-        #image_class_counts = {'red': 0, 'yellow': 0, 'green': 0}
+        # Calculate sampling intervals
         image_class_counts = {'red': 0, 'green': 0}
         for annotations_list in image_to_annotations.values():
-            #class_counter = {'red': 0, 'yellow': 0, 'green': 0}
             class_counter = {'red': 0, 'green': 0}
-            #if class_sampled['yellow'] < target_per_class['yellow']:
-            #    yellow_shortfall = target_per_class['yellow'] - class_sampled['yellow']
-            #    print(f"Yellow shortfall: {yellow_shortfall}, adding more yellow samples...")
-            if False:
-                # Go through ALL yellow images again
-                for image_key, annotations_list in image_to_annotations.items():
-                    class_counter = {'red': 0, 'yellow': 0, 'green': 0}
-                    for ann in annotations_list:
-                        if ann['label'] in class_counter:
-                            class_counter[ann['label']] += 1
-        
-                    dominant_class = max(class_counter, key=class_counter.get)
-        
-                    if dominant_class == 'yellow' and class_sampled['yellow'] < target_per_class['yellow']:
-                        best_annotation = max(annotations_list, 
-                                            key=lambda ann: (ann.get('x2', 0) - ann.get('x1', 0)) * 
-                                                          (ann.get('y2', 0) - ann.get('y1', 0)))
-                        sampled_images.append(best_annotation)
-                        class_sampled['yellow'] += 1
-
             for ann in annotations_list:
                 if ann['label'] in class_counter:
                     class_counter[ann['label']] += 1
@@ -276,19 +207,11 @@ class LISADatasetProcessor:
                 dominant_class = max(class_counter, key=class_counter.get)
                 image_class_counts[dominant_class] += 1
 
-        print("Unique images per class:")
-        for cls, count in image_class_counts.items():
-            print(f"  {cls}: {count}")
-
-        # Calculate sampling intervals
         sampling_intervals = {}
-        #for cls in ['red', 'yellow', 'green']:
         for cls in ['red', 'green']:
             if image_class_counts[cls] > 0:
-                # If we have fewer images than target, take all (interval=1)
-                # Otherwise calculate interval to reach target
                 if image_class_counts[cls] <= target_per_class[cls]:
-                    sampling_intervals[cls] = 1  # Take all
+                    sampling_intervals[cls] = 1
                 else:
                     sampling_intervals[cls] = max(1, image_class_counts[cls] // target_per_class[cls])
             else:
@@ -300,10 +223,11 @@ class LISADatasetProcessor:
             print(f"  {cls}: every {interval}th image → ~{expected} samples")
 
         # Sample images
-        #class_counters = {'red': 0, 'yellow': 0, 'green': 0}
+        sampled_images = []
+        class_sampled = {'red': 0, 'green': 0}
         class_counters = {'red': 0, 'green': 0}
+    
         for image_key, annotations_list in image_to_annotations.items():
-            #class_counter = {'red': 0, 'yellow': 0, 'green': 0}
             class_counter = {'red': 0, 'green': 0}
             for ann in annotations_list:
                 if ann['label'] in class_counter:
@@ -315,43 +239,28 @@ class LISADatasetProcessor:
             dominant_class = max(class_counter, key=class_counter.get)
             class_counters[dominant_class] += 1
 
-            # Sample based on interval
-            should_sample = (class_counters[dominant_class] % sampling_intervals[dominant_class] == 0)
-        
-            # For yellow: if we have room, be more aggressive
-            if dominant_class == 'yellow' and class_sampled['yellow'] < target_per_class['yellow']:
-                # Take every yellow until we hit target
-                should_sample = True
-
-            if should_sample and class_sampled[dominant_class] < target_per_class[dominant_class]:
-                # Use the annotation with the largest bounding box
+            if (class_counters[dominant_class] % sampling_intervals[dominant_class] == 0 and 
+                class_sampled[dominant_class] < target_per_class[dominant_class]):
+                
                 best_annotation = max(annotations_list, 
                                     key=lambda ann: (ann.get('x2', 0) - ann.get('x1', 0)) * 
                                                   (ann.get('y2', 0) - ann.get('y1', 0)))
             
                 sampled_images.append(best_annotation)
                 class_sampled[dominant_class] += 1
-            
-                # ONLY duplicate yellow if we're still far from target
-                #if dominant_class == 'yellow' and class_sampled['yellow'] < target_per_class['yellow']:
-                #    sampled_images.append(best_annotation)
-                #    class_sampled['yellow'] += 1
 
         print(f"\nSampled {len(sampled_images)} images total")
-        print("Samples per class:")
-        for cls, count in class_sampled.items():
-            print(f"  {cls}: {count}")
 
-        # Extract center crops
+        # Process images - YOLO needs full images with bounding boxes
         counters = {
-            'successful_extractions': 0,
-            #'successful_by_class': {'red': 0, 'yellow': 0, 'green': 0}
+            'successful_detections': 0,
+            'successful_classifications': 0,
             'successful_by_class': {'red': 0, 'green': 0}
         }
 
         for i, annotation in enumerate(sampled_images):
             if i % 100 == 0 and i > 0:
-                print(f"Progress ({i}/{len(sampled_images)}):\n{i / len(sampled_images)*100:.1f}%")
+                print(f"Progress ({i}/{len(sampled_images)}): {i / len(sampled_images)*100:.1f}%")
     
             sequence = annotation.get('sequence', 'dayTrain')
             clip_name = annotation.get('clip', None)
@@ -377,43 +286,27 @@ class LISADatasetProcessor:
                 
                         height, width = img.shape[:2]
                 
-                        # Extract center crop based on traffic light location
-                        tl_center_x = (annotation['x1'] + annotation['x2']) // 2
-                        tl_center_y = (annotation['y1'] + annotation['y2']) // 2
-                
-                        # Calculate tight crop based on bbox size
-                        bbox_width = annotation['x2'] - annotation['x1']
-                        bbox_height = annotation['y2'] - annotation['y1']
-
-                        # Crop should be 2-3x the traffic light size, not half the image
-                        crop_size = max(bbox_width, bbox_height) * 4
-                        crop_size = min(crop_size, 300)  # Cap at 300px
-                        crop_size = max(crop_size, 100)  # Minimum 100px
-                
-                        x1 = max(0, tl_center_x - crop_size // 2)
-                        y1 = max(0, tl_center_y - crop_size // 2)
-                        x2 = min(width, tl_center_x + crop_size // 2)
-                        y2 = min(height, tl_center_y + crop_size // 2)
-                
-                        center_crop = img[y1:y2, x1:x2]
-                
-                        if center_crop.size == 0:
-                            continue
-                
-                        crop_resized = cv2.resize(center_crop, CONFIG['img_size'])
-                        crop_rgb = cv2.cvtColor(crop_resized, cv2.COLOR_BGR2RGB)
-
-                        # In _extract_center_crop_regions, after creating crop_rgb:
-                        if counters['successful_by_class'][annotation['label']] < 10:
-                            # Save first 10 of each class for inspection
-                            debug_dir = Path('debug_crops') / annotation['label']
-                            debug_dir.mkdir(parents=True, exist_ok=True)
-                            debug_path = debug_dir / f"{counters['successful_by_class'][annotation['label']]:03d}.png"
-                            cv2.imwrite(str(debug_path), cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2BGR))
-                
-                        self.images.append(crop_rgb)
+                        # YOLO APPROACH: Store full image with bounding box
+                        img_resized = cv2.resize(img, CONFIG['detection_img_size'])
+                        img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+                        
+                        # Scale bounding box to resized image dimensions
+                        scale_x = CONFIG['detection_img_size'][0] / width
+                        scale_y = CONFIG['detection_img_size'][1] / height
+                        
+                        scaled_x1 = annotation['x1'] * scale_x
+                        scaled_y1 = annotation['y1'] * scale_y
+                        scaled_x2 = annotation['x2'] * scale_x
+                        scaled_y2 = annotation['y2'] * scale_y
+                        
+                        bbox_scaled = np.array([scaled_x1, scaled_y1, scaled_x2, scaled_y2])
+                        
+                        # Store full image, bbox, and label for YOLO training
+                        self.images.append(img_rgb)
+                        self.bboxes.append(bbox_scaled)
                         self.labels.append(annotation['label'])
-                        counters['successful_extractions'] += 1
+                        
+                        counters['successful_detections'] += 1
                         counters['successful_by_class'][annotation['label']] += 1
                 
                         break
@@ -421,694 +314,409 @@ class LISADatasetProcessor:
                     except Exception as e:
                         continue
 
-        print(f"\nExtracted {counters['successful_extractions']} center crops")
+        print(f"\nExtraction complete:")
+        print(f"  Total YOLO samples: {counters['successful_detections']}")
         for cls, count in counters['successful_by_class'].items():
-            print(f"  {cls}: {count}")
+            print(f"    {cls}: {count}")
 
         self.annotations.clear()
-    
-    def _extract_traffic_light_regions_improved(self, images_base):
-        """Extract traffic light regions with BALANCED SAMPLING by class"""
-    
-        print("Extracting traffic light regions with balanced sampling...")
-        print(f"Original annotations: {len(self.annotations)}")
-    
-        # PASO 1: Analizar distribución de clases ANTES del sampling
-        class_counts = {'red': 0, 'yellow': 0, 'green': 0}
-        for annotation in self.annotations:
-            label = annotation['label']
-            if label in class_counts:
-                class_counts[label] += 1
-    
-        print("Original class distribution:")
-        for cls, count in class_counts.items():
-            print(f"  {cls}: {count:,}")
-    
-        # PASO 2: Sampling balanceado por clase
-        target_samples_per_class = 3000  # Objetivo: 3000 por clase
-    
-        sampled_annotations = []
-        class_sampled = {'red': 0, 'yellow': 0, 'green': 0}
-    
-        # Calcular intervalos de sampling por clase
-        sampling_intervals = {}
-        for cls in class_counts:
-            if class_counts[cls] > 0:
-                # Intervalo para conseguir target_samples_per_class de cada clase
-                sampling_intervals[cls] = max(1, class_counts[cls] // target_samples_per_class)
-            else:
-                sampling_intervals[cls] = 1
-    
-        print(f"\nSampling intervals:")
-        for cls, interval in sampling_intervals.items():
-            expected = class_counts[cls] // interval if class_counts[cls] > 0 else 0
-            print(f"  {cls}: every {interval}th sample → ~{expected} samples")
-    
-        # Aplicar sampling balanceado
-        class_counters = {'red': 0, 'yellow': 0, 'green': 0}
-    
-        for annotation in self.annotations:
-            label = annotation['label']
-            if label not in class_counters:
-                continue
-            
-            class_counters[label] += 1
-        
-            # Tomar muestra si cumple el intervalo Y no hemos alcanzado el máximo
-            if (class_counters[label] % sampling_intervals[label] == 0 and 
-                class_sampled[label] < target_samples_per_class):
-            
-                sampled_annotations.append(annotation)
-                class_sampled[label] += 1
-    
-        print(f"\nAfter balanced sampling:")
-        total_sampled = sum(class_sampled.values())
-        for cls, count in class_sampled.items():
-            percentage = (count / total_sampled * 100) if total_sampled > 0 else 0
-            print(f"  {cls}: {count} ({percentage:.1f}%)")
-    
-        print(f"Total sampled: {total_sampled} (vs original {len(self.annotations)})")
-    
-        # PASO 3: Procesar imágenes con tracking detallado
-        counters = {
-            'sampled_annotations': len(sampled_annotations),
-            'image_not_found': 0,
-            'invalid_bbox_dimensions': 0,
-            'invalid_bbox_bounds': 0,
-            'roi_too_small': 0,
-            'processing_errors': 0,
-            'successful_extractions': 0,
-            'successful_by_class': {'red': 0, 'yellow': 0, 'green': 0}
-        }
-    
-        for i, annotation in enumerate(sampled_annotations):
-            # Progress tracking
-            if i % 100 == 0 and i > 0:
-                success_rate = counters['successful_extractions'] / i * 100
-                print(f"Progress: {i}/{len(sampled_annotations)} ({i/len(sampled_annotations)*100:.1f}%) - Success: {success_rate:.1f}%")
-            
-                # Class-wise progress
-                print("  Class progress:", end=" ")
-                for cls in ['red', 'yellow', 'green']:
-                    print(f"{cls}:{counters['successful_by_class'][cls]}", end=" ")
-                print()
-        
-            image_found = False
-        
-            # Build image paths
-            sequence = annotation.get('sequence', 'dayTrain')
-            clip_name = annotation.get('clip', None)
-        
-            possible_paths = []
-            if clip_name:
-                possible_paths.extend([
-                    images_base / sequence / sequence / clip_name / "frames" / annotation['filename'],
-                    images_base / sequence / clip_name / "frames" / annotation['filename']
-                ])
-            else:
-                possible_paths.extend([
-                    images_base / sequence / sequence / "frames" / annotation['filename'],
-                    images_base / sequence / "frames" / annotation['filename'],
-                    images_base / "frames" / annotation['filename']
-                ])
-        
-            # Try to find and process image
-            for image_path in possible_paths:
-                if image_path.exists():
-                    try:
-                        img = cv2.imread(str(image_path))
-                        if img is None:
-                            continue
-                    
-                        height, width = img.shape[:2]
-                        x1, y1, x2, y2 = annotation['x1'], annotation['y1'], annotation['x2'], annotation['y2']
-                    
-                        # Validate bbox dimensions
-                        if x1 >= x2 or y1 >= y2:
-                            counters['invalid_bbox_dimensions'] += 1
-                            break
-                    
-                        # Validate bbox bounds
-                        if x1 >= width or y1 >= height or x2 <= 0 or y2 <= 0:
-                            counters['invalid_bbox_bounds'] += 1
-                            break
-                    
-                        # Clamp and pad bbox
-                        x1 = max(0, min(x1, width - 1))
-                        y1 = max(0, min(y1, height - 1))
-                        x2 = max(x1 + 1, min(x2, width))
-                        y2 = max(y1 + 1, min(y2, height))
-                    
-                        # Smart padding based on class (green lights are often smaller)
-                        bbox_width = x2 - x1
-                        bbox_height = y2 - y1
-                    
-                        if annotation['label'] == 'green' or bbox_width < 15 or bbox_height < 15:
-                            # More aggressive padding for small/green lights
-                            padding_x = max(20, int(bbox_width * 0.8))
-                            padding_y = max(20, int(bbox_height * 0.8))
-                        else:
-                            # Normal padding for red/yellow lights
-                            padding_x = max(5, int(bbox_width * 0.2))
-                            padding_y = max(5, int(bbox_height * 0.2))
-                    
-                        x1 = max(0, x1 - padding_x)
-                        y1 = max(0, y1 - padding_y)
-                        x2 = min(width, x2 + padding_x)
-                        y2 = min(height, y2 + padding_y)
-                    
-                        # Extract ROI
-                        roi = img[y1:y2, x1:x2]
-                    
-                        if roi.size == 0 or roi.shape[0] < 5 or roi.shape[1] < 5:
-                            counters['roi_too_small'] += 1
-                            break
-                    
-                        # Process ROI
-                        roi_resized = cv2.resize(roi, CONFIG['img_size'])
-                        roi_rgb = cv2.cvtColor(roi_resized, cv2.COLOR_BGR2RGB)
-                    
-                        self.images.append(roi_rgb)
-                        self.labels.append(annotation['label'])
-                        counters['successful_extractions'] += 1
-                        counters['successful_by_class'][annotation['label']] += 1
-                    
-                        image_found = True
-                        break
-                    
-                    except Exception as e:
-                        counters['processing_errors'] += 1
-                        if counters['processing_errors'] <= 3:
-                            print(f"    Processing error: {e}")
-                        break
-        
-            if not image_found:
-                counters['image_not_found'] += 1
-    
-        # PASO 4: Reporte final detallado
-        print("\n" + "="*50)
-        print("FINAL EXTRACTION REPORT")
-        print("="*50)
-    
-        print(f"Sampled annotations:        {counters['sampled_annotations']:,}")
-        print(f"Successful extractions:     {counters['successful_extractions']:,}")
-        print(f"Success rate:               {counters['successful_extractions']/counters['sampled_annotations']*100:.1f}%")
-    
-        print(f"\nLoss breakdown:")
-        print(f"  Images not found:         {counters['image_not_found']:,}")
-        print(f"  Invalid bbox dimensions:  {counters['invalid_bbox_dimensions']:,}")
-        print(f"  Invalid bbox bounds:      {counters['invalid_bbox_bounds']:,}")
-        print(f"  ROI too small:            {counters['roi_too_small']:,}")
-        print(f"  Processing errors:        {counters['processing_errors']:,}")
-    
-        print(f"\nFinal class distribution:")
-        total_final = sum(counters['successful_by_class'].values())
-        for cls in ['red', 'yellow', 'green']:
-            count = counters['successful_by_class'][cls]
-            percentage = (count / total_final * 100) if total_final > 0 else 0
-            print(f"  {cls}: {count:,} ({percentage:.1f}%)")
-    
-        # Clear memory
-        self.annotations.clear()
-
-    def _extract_full_scenes(self, images_base):
-        """Extract FULL SCENES instead of cropped traffic light regions - BALANCED SAMPLING by class"""
-
-        print("Extracting FULL SCENES with balanced sampling...")
-        print(f"Original annotations: {len(self.annotations)}")
-
-        # PASO 1: Analizar distribución de clases ANTES del sampling
-        class_counts = {'red': 0, 'yellow': 0, 'green': 0}
-        for annotation in self.annotations:
-            label = annotation['label']
-            if label in class_counts:
-                class_counts[label] += 1
-
-        print("Original class distribution:")
-        for cls, count in class_counts.items():
-            print(f"  {cls}: {count:,}")
-
-        # PASO 2: Sampling balanceado por clase - reducido para full scenes
-        target_samples_per_class = 5000  # Reducido porque full scenes son más informativos
-
-        # Group annotations by image to avoid duplicates per image
-        image_to_annotations = {}
-        for annotation in self.annotations:
-            sequence = annotation.get('sequence', 'dayTrain')
-            clip_name = annotation.get('clip', '')
-            filename = annotation['filename']
-            image_key = f"{sequence}_{clip_name}_{filename}"
-        
-            if image_key not in image_to_annotations:
-                image_to_annotations[image_key] = []
-            image_to_annotations[image_key].append(annotation)
-
-        print(f"Unique images available: {len(image_to_annotations)}")
-
-        # Sample images (not individual annotations) by class
-        sampled_images = []
-        class_sampled = {'red': 0, 'yellow': 0, 'green': 0}
-
-        # Calculate sampling intervals per class based on unique images
-        image_class_counts = {'red': 0, 'yellow': 0, 'green': 0}
-        for annotations_list in image_to_annotations.values():
-            # Count each image by its dominant class
-            class_counter = {'red': 0, 'yellow': 0, 'green': 0}
-            for ann in annotations_list:
-                if ann['label'] in class_counter:
-                    class_counter[ann['label']] += 1
-        
-            # Assign image to class with most annotations
-            dominant_class = max(class_counter, key=class_counter.get)
-            if class_counter[dominant_class] > 0:
-                image_class_counts[dominant_class] += 1
-
-        sampling_intervals = {}
-        for cls in class_counts:
-            if image_class_counts[cls] > 0:
-                sampling_intervals[cls] = max(1, image_class_counts[cls] // target_samples_per_class)
-            else:
-                sampling_intervals[cls] = 1
-
-        print(f"\nImage-level sampling intervals:")
-        for cls, interval in sampling_intervals.items():
-            expected = image_class_counts[cls] // interval if image_class_counts[cls] > 0 else 0
-            print(f"  {cls}: every {interval}th image → ~{expected} images")
-
-        # Sample images by class
-        class_counters = {'red': 0, 'yellow': 0, 'green': 0}
-    
-        for image_key, annotations_list in image_to_annotations.items():
-            # Determine dominant class for this image
-            class_counter = {'red': 0, 'yellow': 0, 'green': 0}
-            for ann in annotations_list:
-                if ann['label'] in class_counter:
-                    class_counter[ann['label']] += 1
-        
-            if sum(class_counter.values()) == 0:
-                continue
-            
-            dominant_class = max(class_counter, key=class_counter.get)
-            class_counters[dominant_class] += 1
-        
-            # Take sample if it meets interval AND we haven't reached maximum
-            if (class_counters[dominant_class] % sampling_intervals[dominant_class] == 0 and 
-                class_sampled[dominant_class] < target_samples_per_class):
-            
-                # Use the annotation with the largest bounding box (most prominent traffic light)
-                best_annotation = max(annotations_list, 
-                                    key=lambda ann: (ann.get('x2', 0) - ann.get('x1', 0)) * 
-                                                  (ann.get('y2', 0) - ann.get('y1', 0)))
-            
-                sampled_images.append(best_annotation)
-                class_sampled[dominant_class] += 1
-
-        print(f"\nAfter balanced image sampling:")
-        total_sampled = sum(class_sampled.values())
-        for cls, count in class_sampled.items():
-            percentage = (count / total_sampled * 100) if total_sampled > 0 else 0
-            print(f"  {cls}: {count} ({percentage:.1f}%)")
-
-        print(f"Total sampled images: {total_sampled} (vs original {len(image_to_annotations)} unique images)")
-
-        # PASO 3: Procesar imágenes COMPLETAS con tracking detallado
-        counters = {
-            'sampled_images': len(sampled_images),
-            'image_not_found': 0,
-            'processing_errors': 0,
-            'successful_extractions': 0,
-            'successful_by_class': {'red': 0, 'yellow': 0, 'green': 0}
-        }
-
-        for i, annotation in enumerate(sampled_images):
-            # Progress tracking
-            if i % 100 == 0 and i > 0:
-                success_rate = counters['successful_extractions'] / i * 100
-                print(f"Progress: {i}/{len(sampled_images)} ({i/len(sampled_images)*100:.1f}%) - Success: {success_rate:.1f}%")
-        
-                # Class-wise progress
-                print("  Class progress:", end=" ")
-                for cls in ['red', 'yellow', 'green']:
-                    print(f"{cls}:{counters['successful_by_class'][cls]}", end=" ")
-                print()
-    
-            image_found = False
-    
-            # Build image paths
-            sequence = annotation.get('sequence', 'dayTrain')
-            clip_name = annotation.get('clip', None)
-    
-            possible_paths = []
-            if clip_name:
-                possible_paths.extend([
-                    images_base / sequence / sequence / clip_name / "frames" / annotation['filename'],
-                    images_base / sequence / clip_name / "frames" / annotation['filename']
-                ])
-            else:
-                possible_paths.extend([
-                    images_base / sequence / sequence / "frames" / annotation['filename'],
-                    images_base / sequence / "frames" / annotation['filename'],
-                    images_base / "frames" / annotation['filename']
-                ])
-    
-            # Try to find and process image
-            for image_path in possible_paths:
-                if image_path.exists():
-                    try:
-                        img = cv2.imread(str(image_path))
-                        if img is None:
-                            continue
-                
-                        height, width = img.shape[:2]
-                    
-                        # CRITICAL CHANGE: Process FULL IMAGE instead of cropped region
-                    
-                        # Optional: Focus on relevant part of image if it's very large
-                        if width > 640 or height > 480:
-                            # If image is very large, crop to center region to focus on traffic lights
-                            center_x, center_y = width // 2, height // 2
-                            crop_width = min(640, width)
-                            crop_height = min(480, height)
-                        
-                            x1 = max(0, center_x - crop_width // 2)
-                            y1 = max(0, center_y - crop_height // 2)
-                            x2 = min(width, x1 + crop_width)
-                            y2 = min(height, y1 + crop_height)
-                        
-                            img = img[y1:y2, x1:x2]
-                    
-                        # Resize ENTIRE image to model input size
-                        # This preserves the full context and scene information
-                        full_scene_resized = cv2.resize(img, CONFIG['img_size'])
-                        full_scene_rgb = cv2.cvtColor(full_scene_resized, cv2.COLOR_BGR2RGB)
-                
-                        self.images.append(full_scene_rgb)
-                        self.labels.append(annotation['label'])
-                        counters['successful_extractions'] += 1
-                        counters['successful_by_class'][annotation['label']] += 1
-                
-                        image_found = True
-                        break
-                
-                    except Exception as e:
-                        counters['processing_errors'] += 1
-                        if counters['processing_errors'] <= 3:
-                            print(f"    Processing error: {e}")
-                        break
-    
-            if not image_found:
-                counters['image_not_found'] += 1
-
-        # PASO 4: Reporte final detallado
-        print("\n" + "="*50)
-        print("FINAL FULL SCENE EXTRACTION REPORT")
-        print("="*50)
-
-        print(f"Sampled images:             {counters['sampled_images']:,}")
-        print(f"Successful extractions:     {counters['successful_extractions']:,}")
-        print(f"Success rate:               {counters['successful_extractions']/counters['sampled_images']*100:.1f}%")
-
-        print(f"\nLoss breakdown:")
-        print(f"  Images not found:         {counters['image_not_found']:,}")
-        print(f"  Processing errors:        {counters['processing_errors']:,}")
-
-        print(f"\nFinal class distribution:")
-        total_final = sum(counters['successful_by_class'].values())
-        for cls in ['red', 'yellow', 'green']:
-            count = counters['successful_by_class'][cls]
-            percentage = (count / total_final * 100) if total_final > 0 else 0
-            print(f"  {cls}: {count:,} ({percentage:.1f}%)")
-
-        print("\nKEY DIFFERENCE: Training on full scenes instead of cropped traffic light regions")
-        print("This should better match your ESP32 deployment scenario!")
-
-        # Clear memory
-        self.annotations.clear()
-    
-    def _print_dataset_structure_info(self, images_base):
-        """Print information about the dataset structure for debugging"""
-        print("\nDataset structure analysis:")
-        
-        # Check what directories exist
-        for item in images_base.iterdir():
-            if item.is_dir():
-                print(f"Directory found: {item.name}")
-                
-                # Check subdirectories
-                for subitem in item.iterdir():
-                    if subitem.is_dir():
-                        print(f"  Subdirectory: {item.name}/{subitem.name}")
-                        
-                        # Check for frames directory
-                        frames_dir = subitem / "frames"
-                        if frames_dir.exists():
-                            frame_count = len(list(frames_dir.glob("*.png"))) + len(list(frames_dir.glob("*.jpg")))
-                            print(f"    Frames directory found with {frame_count} images")
-        
-        # Print sample annotations for debugging
-        if len(self.annotations) > 0:
-            print(f"\nSample annotations:")
-            for i, ann in enumerate(self.annotations[:3]):
-                print(f"  {i+1}: {ann}")
-                if i >= 2:
-                    break
     
     def load_images_and_labels(self):
-        """Load images and labels from directory structure or LISA data"""
-        
-        # If LISA data was processed, use it
+        """Load processed images and labels"""
         if len(self.images) > 0 and len(self.labels) > 0:
             print("Using processed LISA dataset")
             return np.array(self.images), np.array(self.labels)
         
-        # Otherwise, load from directory structure (synthetic data)
-        print("Loading from directory structure...")
-        images = []
-        labels = []
-        
-        for class_name in CONFIG['classes']:
-            class_dir = self.data_dir / class_name
-            
-            if class_dir.exists():
-                for img_path in class_dir.glob("*.png"):
-                    try:
-                        img = cv2.imread(str(img_path))
-                        if img is not None:
-                            img = cv2.resize(img, CONFIG['img_size'])
-                            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                            images.append(img)
-                            labels.append(class_name)
-                    except Exception as e:
-                        print(f"Error loading {img_path}: {e}")
-        
-        return np.array(images), np.array(labels)
+        return np.array([]), np.array([])
 
-class TrafficLightModel:
-    """Traffic Light Classification Model"""
+    def load_detection_data(self):
+        """Return detection-specific data: images with bounding boxes and labels"""
+        if len(self.images) > 0 and len(self.bboxes) > 0:
+            # Convert string labels to integers for YOLO
+            label_map = {'red': 0, 'green': 1}
+            labels_encoded = np.array([label_map[label] for label in self.labels])
+            return np.array(self.images), np.array(self.bboxes), labels_encoded
+        return np.array([]), np.array([]), np.array([])
+
+
+class TrafficLightDetectionModel:
+    """YOLOv5-inspired lightweight detection model for traffic lights"""
     
     def __init__(self):
         self.model = None
-        self.label_encoder = LabelEncoder()
         self.history = None
+        self.grid_size = 7  # 7x7 grid cells
+        self.num_boxes = 2  # 2 anchor boxes per cell
+        self.num_classes = 2  # red, green (detection + classification in one)
         
-    def create_model(self, input_shape, num_classes):
-        """Create lightweight MobileNetV2-based model for ESP32-S3"""
+    def create_yolo_detection_model(self, input_shape):
+        """
+        Create YOLO-style detection model with IMPROVED MobileNetV2 backbone
+        Output: (grid_size, grid_size, num_boxes * (5 + num_classes))
+        Each box: [x, y, w, h, confidence, class_probs...]
+        """
         
-        # Use MobileNetV2 as base (efficient for mobile devices)
+        inputs = keras.Input(shape=input_shape + (3,))
+        
+        # Use pretrained MobileNetV2 as backbone (MUCH better features)
         base_model = keras.applications.MobileNetV2(
             input_shape=input_shape + (3,),
             include_top=False,
-            weights='imagenet',
-            alpha=0.5  # Reduced width multiplier for lighter model
+            weights='imagenet',  # Pretrained on ImageNet
+            alpha=0.75  # Width multiplier (0.75 = good balance for ESP32)
         )
         
-        # Freeze base model layers
+        # Fine-tune the last few layers
         base_model.trainable = True
+        for layer in base_model.layers[:-30]:  # Freeze early layers
+            layer.trainable = False
         
-        # Add custom classification head
-        model = keras.Sequential([
-            base_model,
-            layers.GlobalAveragePooling2D(),
-            layers.Dropout(0.3),
-            layers.Dense(32, activation='relu'),
-            layers.Dropout(0.2),
-            layers.Dense(num_classes, activation='softmax')
-        ])
+        # Extract features from backbone
+        x = base_model(inputs, training=False)
         
+        # Detection head with residual connections
+        x = layers.Conv2D(256, (3, 3), padding='same', activation='relu')(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.Dropout(0.3)(x)
+        
+        x = layers.Conv2D(128, (3, 3), padding='same', activation='relu')(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.Dropout(0.2)(x)
+        
+        # Final prediction layer
+        outputs = layers.Conv2D(
+            self.num_boxes * (5 + self.num_classes), 
+            (1, 1), 
+            padding='same'
+        )(x)
+        
+        # Reshape to (grid_size, grid_size, num_boxes, 5 + num_classes)
+        outputs = layers.Reshape((self.grid_size, self.grid_size, 
+                                 self.num_boxes, 5 + self.num_classes))(outputs)
+        
+        model = keras.Model(inputs=inputs, outputs=outputs)
         return model
     
+    def yolo_loss(self, y_true, y_pred):
+        """
+        SIMPLIFIED YOLO loss function that actually works
+        Focus on the essentials: bbox localization + confidence + classification
+        """
+        
+        # Split predictions (apply activations)
+        pred_xy = tf.sigmoid(y_pred[..., 0:2])  # x, y offsets [0,1]
+        pred_wh = tf.sigmoid(y_pred[..., 2:4])  # w, h [0,1] - CHANGED to sigmoid
+        pred_conf = tf.sigmoid(y_pred[..., 4:5])  # objectness confidence
+        pred_class = y_pred[..., 5:]  # class logits (we'll use softmax in loss)
+        
+        # Split ground truth
+        true_xy = y_true[..., 0:2]
+        true_wh = y_true[..., 2:4]
+        true_conf = y_true[..., 4:5]
+        true_class = y_true[..., 5:]
+        
+        # Object mask (which cells have objects)
+        obj_mask = true_conf  # Already 0 or 1
+        noobj_mask = 1.0 - obj_mask
+        
+        # 1. Localization loss (MSE for coordinates)
+        xy_loss = obj_mask * tf.reduce_sum(
+            tf.square(true_xy - pred_xy), 
+            axis=-1, keepdims=True
+        )
+        
+        wh_loss = obj_mask * tf.reduce_sum(
+            tf.square(true_wh - pred_wh),  # Direct MSE, no sqrt
+            axis=-1, keepdims=True
+        )
+        
+        # 2. Confidence loss (binary cross-entropy style)
+        conf_loss_obj = obj_mask * tf.square(1.0 - pred_conf)  # Want confidence = 1
+        conf_loss_noobj = noobj_mask * tf.square(0.0 - pred_conf)  # Want confidence = 0
+        
+        # 3. Classification loss (categorical cross-entropy)
+        class_loss = obj_mask * tf.keras.losses.categorical_crossentropy(
+            true_class, 
+            pred_class,
+            from_logits=True  # pred_class are raw logits
+        )[..., tf.newaxis]
+        
+        # Weighted sum of losses
+        total_loss = (
+            10.0 * tf.reduce_mean(xy_loss) +      # High weight for location
+            10.0 * tf.reduce_mean(wh_loss) +      # High weight for size
+            5.0 * tf.reduce_mean(conf_loss_obj) + # Penalize missed objects
+            0.5 * tf.reduce_mean(conf_loss_noobj) + # Low penalty for background
+            2.0 * tf.reduce_mean(class_loss)      # Classification matters
+        )
+        
+        return total_loss
+    
+    def encode_yolo_target(self, bboxes, labels, img_size):
+        """
+        Convert bounding boxes to YOLO target format
+        bboxes: [x1, y1, x2, y2] in pixel coordinates
+        labels: class labels (0=red, 1=green)
+        Returns: (grid_size, grid_size, num_boxes, 5 + num_classes)
+        """
+        
+        batch_size = len(bboxes)
+        targets = np.zeros((batch_size, self.grid_size, self.grid_size, 
+                          self.num_boxes, 5 + self.num_classes))
+        
+        for b in range(batch_size):
+            bbox = bboxes[b]
+            label = labels[b]
+            
+            # Convert to YOLO format (center x, center y, width, height)
+            x_center = (bbox[0] + bbox[2]) / 2.0 / img_size[0]
+            y_center = (bbox[1] + bbox[3]) / 2.0 / img_size[1]
+            width = (bbox[2] - bbox[0]) / img_size[0]
+            height = (bbox[3] - bbox[1]) / img_size[1]
+            
+            # Clamp to valid range
+            x_center = np.clip(x_center, 0, 0.999)
+            y_center = np.clip(y_center, 0, 0.999)
+            width = np.clip(width, 0, 1)
+            height = np.clip(height, 0, 1)
+            
+            # Find which grid cell this object belongs to
+            grid_x = int(x_center * self.grid_size)
+            grid_y = int(y_center * self.grid_size)
+            
+            # Offset within the cell
+            x_offset = x_center * self.grid_size - grid_x
+            y_offset = y_center * self.grid_size - grid_y
+            
+            # Assign to first anchor box (simplified - proper YOLO uses IoU matching)
+            targets[b, grid_y, grid_x, 0, 0] = x_offset
+            targets[b, grid_y, grid_x, 0, 1] = y_offset
+            targets[b, grid_y, grid_x, 0, 2] = width
+            targets[b, grid_y, grid_x, 0, 3] = height
+            targets[b, grid_y, grid_x, 0, 4] = 1.0  # Confidence
+            
+            # One-hot encode class
+            targets[b, grid_y, grid_x, 0, 5 + label] = 1.0
+        
+        return targets
+    
+    def train_model(self, X_train, bboxes_train, labels_train, X_val, bboxes_val, labels_val):
+        """Train YOLO-style detection model"""
+        
+        self.model = self.create_yolo_detection_model(CONFIG['detection_img_size'])
+        
+        # Encode targets to YOLO format
+        print("Encoding YOLO targets...")
+        y_train = self.encode_yolo_target(bboxes_train, labels_train, CONFIG['detection_img_size'])
+        y_val = self.encode_yolo_target(bboxes_val, labels_val, CONFIG['detection_img_size'])
+        
+        optimizer = keras.optimizers.Adam(learning_rate=0.001)
+        self.model.compile(
+            optimizer=optimizer,
+            loss=self.yolo_loss,
+            metrics=['accuracy']
+        )
+        
+        callbacks = [
+            keras.callbacks.EarlyStopping(
+                patience=15,
+                restore_best_weights=True,
+                monitor='val_loss'
+            ),
+            keras.callbacks.ReduceLROnPlateau(
+                factor=0.5,
+                patience=5,
+                min_lr=1e-6,
+                monitor='val_loss'
+            ),
+            keras.callbacks.LearningRateScheduler(
+                lambda epoch: 0.001 * (0.95 ** epoch)
+            )
+        ]
+        
+        print("Training YOLO detection model...")
+        print(f"Model output shape: {self.model.output_shape}")
+        self.model.summary()
+        
+        # Normalize images
+        X_train_norm = X_train.astype(np.float32) / 255.0
+        X_val_norm = X_val.astype(np.float32) / 255.0
+        
+        self.history = self.model.fit(
+            X_train_norm, y_train,
+            batch_size=CONFIG['batch_size'],
+            epochs=CONFIG['epochs'],
+            validation_data=(X_val_norm, y_val),
+            callbacks=callbacks,
+            verbose=1
+        )
+        
+        return self.history
+    
+    def decode_predictions(self, predictions, confidence_threshold=0.5):
+        """
+        Decode YOLO predictions to bounding boxes
+        Returns: list of (bbox, class_id, confidence) tuples
+        """
+        
+        detections = []
+        
+        for i in range(self.grid_size):
+            for j in range(self.grid_size):
+                for b in range(self.num_boxes):
+                    # Extract prediction
+                    pred = predictions[i, j, b]
+                    
+                    x_offset = tf.sigmoid(pred[0]).numpy()
+                    y_offset = tf.sigmoid(pred[1]).numpy()
+                    width = pred[2]
+                    height = pred[3]
+                    confidence = tf.sigmoid(pred[4]).numpy()
+                    class_probs = tf.nn.softmax(pred[5:]).numpy()
+                    
+                    if confidence < confidence_threshold:
+                        continue
+                    
+                    # Convert to absolute coordinates
+                    x_center = (j + x_offset) / self.grid_size
+                    y_center = (i + y_offset) / self.grid_size
+                    
+                    # Convert to bbox format [x1, y1, x2, y2]
+                    x1 = (x_center - width / 2) * CONFIG['detection_img_size'][0]
+                    y1 = (y_center - height / 2) * CONFIG['detection_img_size'][1]
+                    x2 = (x_center + width / 2) * CONFIG['detection_img_size'][0]
+                    y2 = (y_center + height / 2) * CONFIG['detection_img_size'][1]
+                    
+                    bbox = [
+                        np.clip(x1, 0, CONFIG['detection_img_size'][0]),
+                        np.clip(y1, 0, CONFIG['detection_img_size'][1]),
+                        np.clip(x2, 0, CONFIG['detection_img_size'][0]),
+                        np.clip(y2, 0, CONFIG['detection_img_size'][1])
+                    ]
+                    
+                    class_id = np.argmax(class_probs)
+                    class_confidence = class_probs[class_id]
+                    final_confidence = confidence * class_confidence
+                    
+                    detections.append((bbox, class_id, final_confidence))
+        
+        # Non-maximum suppression (simple version)
+        detections = self.nms(detections, iou_threshold=0.5)
+        
+        return detections
+    
+    def nms(self, detections, iou_threshold=0.5):
+        """Non-maximum suppression to remove duplicate detections"""
+        if len(detections) == 0:
+            return []
+        
+        # Sort by confidence
+        detections = sorted(detections, key=lambda x: x[2], reverse=True)
+        
+        keep = []
+        while len(detections) > 0:
+            best = detections[0]
+            keep.append(best)
+            detections = detections[1:]
+            
+            # Remove overlapping boxes
+            filtered = []
+            for det in detections:
+                if self.compute_iou(best[0], det[0]) < iou_threshold:
+                    filtered.append(det)
+            detections = filtered
+        
+        return keep
+    
+    def compute_iou(self, box1, box2):
+        """Compute Intersection over Union of two boxes"""
+        x1 = max(box1[0], box2[0])
+        y1 = max(box1[1], box2[1])
+        x2 = min(box1[2], box2[2])
+        y2 = min(box1[3], box2[3])
+        
+        intersection = max(0, x2 - x1) * max(0, y2 - y1)
+        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        union = area1 + area2 - intersection
+        
+        return intersection / union if union > 0 else 0
+    
+    def predict_bbox(self, image):
+        """Predict bounding box for an image"""
+        if self.model is None:
+            return None
+        
+        img_resized = cv2.resize(image, CONFIG['detection_img_size'])
+        img_normalized = img_resized.astype(np.float32) / 255.0
+        
+        predictions = self.model.predict(np.expand_dims(img_normalized, axis=0), verbose=0)
+        detections = self.decode_predictions(predictions[0])
+        
+        return detections
+    
+    def convert_to_tflite(self, output_path):
+        """Convert detection model to TFLite"""
+        converter = tf.lite.TFLiteConverter.from_keras_model(self.model)
+        
+        # Optimize for size (important for ESP32)
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        
+        tflite_model = converter.convert()
+        
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, 'wb') as f:
+            f.write(tflite_model)
+        
+        print(f"Detection TFLite model saved to: {output_path}")
+        print(f"Model size: {len(tflite_model) / 1024:.2f} KB")
+        
+        return tflite_model
+
+
+class TrafficLightClassificationModel:
+    """Classification model for traffic light colors"""
+    
+    def __init__(self):
+        self.model = None
+        self.history = None
+        
     def create_simple_cnn(self, input_shape, num_classes):
-        """Create simple CNN model"""
-        
         model = keras.Sequential([
-            layers.Conv2D(16, (3, 3), activation='relu', input_shape=input_shape + (3,)),
+            layers.Conv2D(32, (3, 3), activation='relu', input_shape=input_shape + (3,)),
             layers.MaxPooling2D(2, 2),
+            layers.Dropout(0.2),  # Added dropout
         
-            layers.Conv2D(32, (3, 3), activation='relu'),
+            layers.Conv2D(64, (3, 3), activation='relu'),
             layers.MaxPooling2D(2, 2),
+            layers.Dropout(0.3),  # Added dropout
         
-            layers.Conv2D(32, (3, 3), activation='relu'),
+            layers.Conv2D(64, (3, 3), activation='relu'),
             layers.MaxPooling2D(2, 2),
+            layers.Dropout(0.4),  # Added dropout
         
             layers.Flatten(),
-            layers.Dense(64, activation='relu'),
+            layers.Dense(128, activation='relu', kernel_regularizer=keras.regularizers.l2(0.01)),
             layers.Dropout(0.5),
             layers.Dense(num_classes, activation='softmax')
         ])
-
         return model
-
-    def create_class_balanced_generator(self, X_train, y_train_cat, y_train_labels):
-        # Split by class
-        red_mask = y_train_labels == 'red'
-        yellow_mask = y_train_labels == 'yellow'
-        green_mask = y_train_labels == 'green'
-    
-        # RED gets extreme augmentation
-        red_datagen = ImageDataGenerator(
-            rotation_range=5,
-            brightness_range=[0.4, 1.8],  # Very wide
-            channel_shift_range=50,       # Extreme
-            zoom_range=0.2,
-            width_shift_range=0.1,
-            height_shift_range=0.1,
-            horizontal_flip=False
-        )
-    
-        # Standard for yellow/green
-        standard_datagen = self.create_traffic_light_augmentation()
-    
-        # Create generators with balanced batch sizes
-        red_gen = red_datagen.flow(X_train[red_mask], y_train_cat[red_mask], 
-                                    batch_size=8, shuffle=True)
-        yellow_gen = standard_datagen.flow(X_train[yellow_mask], y_train_cat[yellow_mask], 
-                                           batch_size=4, shuffle=True)
-        green_gen = standard_datagen.flow(X_train[green_mask], y_train_cat[green_mask], 
-                                          batch_size=4, shuffle=True)
-    
-        # Combined generator
-        while True:
-            r_batch = next(red_gen)
-            y_batch = next(yellow_gen)
-            g_batch = next(green_gen)
-        
-            X_combined = np.concatenate([r_batch[0], y_batch[0], g_batch[0]])
-            y_combined = np.concatenate([r_batch[1], y_batch[1], g_batch[1]])
-        
-            indices = np.random.permutation(len(X_combined))
-            yield X_combined[indices], y_combined[indices]
-
-    def create_traffic_light_augmentation(self):
-        """Specialized augmentation for traffic lights"""
-    
-        train_datagen = ImageDataGenerator(
-            # Geometric augmentations (conservative for traffic lights)
-            rotation_range=3,            # Very small rotation only
-            width_shift_range=0.03,      # Minimal shifts
-            height_shift_range=0.03,
-            zoom_range=0.03,             # Minimal zoom
-            # shear_range=0.02,            # Very small shear
-        
-            # Photometric augmentations (more important for traffic lights)
-            brightness_range=[0.6, 1.4], # More aggressive brightness variation
-            channel_shift_range=10,       # Color channel variations
-        
-            # No flipping for traffic lights
-            horizontal_flip=False,
-            vertical_flip=False,
-        
-            # Fill mode
-            fill_mode='nearest'
-        )
-    
-        return train_datagen
-
-    def create_class_specific_augmentation(self, class_name):
-        """Different augmentation for each class"""
-        if class_name == 'green':
-            # More aggressive augmentation for green to increase variety
-            return ImageDataGenerator(
-                rotation_range=5,
-                brightness_range=[0.6, 1.4],  # Wider brightness range
-                channel_shift_range=20,        # More color variation
-                zoom_range=0.1,
-                width_shift_range=0.05,
-                height_shift_range=0.05,
-                horizontal_flip=False,
-                vertical_flip=False
-            )
-        else:
-            # Standard augmentation for red/yellow
-            return self.create_traffic_light_augmentation()
-
-    def debug_class_mapping(self, label_encoder, classes_config):
-        """Debug and verify class mapping"""
-        print("\n" + "="*50)
-        print("CLASS MAPPING VERIFICATION")
-        print("="*50)
-    
-        print("Configured classes:", classes_config)
-        print("LabelEncoder classes:", label_encoder.classes_)
-        print("Class to index mapping:")
-    
-        for i, class_name in enumerate(label_encoder.classes_):
-            print(f"  {class_name} -> {i}")
-    
-        # Test encoding/decoding
-        print("\nTesting encoding:")
-        for class_name in ['red', 'yellow', 'green']:
-            if class_name in label_encoder.classes_:
-                encoded = label_encoder.transform([class_name])[0]
-                decoded = label_encoder.inverse_transform([encoded])[0]
-                print(f"  {class_name} -> {encoded} -> {decoded}")
-            else:
-                print(f"  {class_name} -> NOT FOUND IN ENCODER!")
-    
-        # Verify consistency
-        is_consistent = (list(label_encoder.classes_) == classes_config)
-        print(f"\nClass order consistent with config: {is_consistent}")
-    
-        if not is_consistent:
-            print("WARNING: Class order mismatch detected!")
-            print("This will cause prediction errors!")
     
     def train_model(self, X_train, y_train, X_val, y_val):
-        """Train the model"""
-        print("Setting up manual class mapping (no LabelEncoder)...")
-
-        # Manual class mapping with YOUR desired order
-        #desired_classes = ['red', 'yellow', 'green']  # Your desired order
-        desired_classes = ['red','green']  # Your desired order
+        """Train classification model"""
+        
+        # Manual class mapping
+        desired_classes = ['red', 'green']
         class_to_idx = {cls: idx for idx, cls in enumerate(desired_classes)}
         idx_to_class = {idx: cls for idx, cls in enumerate(desired_classes)}
 
-        print(f"Manual class mapping: {class_to_idx}")
-
-        # Manual encoding function
         def manual_encode(labels):
             return np.array([class_to_idx[label] for label in labels])
 
-        def manual_decode(indices):
-            return np.array([idx_to_class[idx] for idx in indices])
-
-        # Store these for later use in evaluation
-        self.class_to_idx = class_to_idx
-        self.idx_to_class = idx_to_class
-        self.encode_labels = manual_encode
-        self.decode_labels = manual_decode
-
-        # Encode labels manually
+        # Encode labels
         y_train_encoded = manual_encode(y_train)
         y_val_encoded = manual_encode(y_val)
 
-        # Verify encoding
-        print(f"\nLabel distribution after manual encoding:")
-        unique, counts = np.unique(y_train_encoded, return_counts=True)
-        for idx, count in zip(unique, counts):
-            class_name = idx_to_class[idx]
-            print(f"  Class {idx} ({class_name}): {count} samples")
-
-        # Convert to categorical
         num_classes = len(desired_classes)
         y_train_cat = keras.utils.to_categorical(y_train_encoded, num_classes)
         y_val_cat = keras.utils.to_categorical(y_val_encoded, num_classes)
@@ -1118,398 +726,273 @@ class TrafficLightModel:
 
         class_weights_array = compute_class_weight(
             'balanced',
-            classes=np.unique(y_train_encoded), 
+            classes=np.unique(y_train_encoded),
             y=y_train_encoded
         )
 
         class_weights = dict(enumerate(class_weights_array))
+        class_weights[0] *= 2.5  # red
+        class_weights[1] *= 2.25  # green
 
-        class_weights[0] *= 2.5  # red - heavily penalize misses
-        #class_weights[1] *= 4.0  # yellow - most confused class needs highest weight
-        class_weights[1] *= 2.25  # green - increase from 1.0
+        self.model = self.create_simple_cnn(CONFIG['img_size'], num_classes)
+        self.class_to_idx = class_to_idx
+        self.idx_to_class = idx_to_class
 
-        # For 95% accuracy with HVS changes
-        # class_weights[0] *= 3.0
-        # class_weights[1] *= 2.0 
-        # class_weights[2] *= 1.0  
-
-        # weights for 92% accuracy with no HVS and simple CNN
-        #class_weights[0] *= 2.0   # red - increase (75% recall too low)
-        #class_weights[1] *= 1.8   # yellow - slight reduce (93% is good but causing 58 red confusions)
-        #class_weights[2] *= 2.2   # green - slight reduce (99% recall is overfit)
-    
-        print(f"Moderate class weights: {class_weights}")
-    
-        # Create improved model
-        # self.model = self.create_model(CONFIG['img_size'], len(CONFIG['classes']))
-        self.model = self.create_simple_cnn(CONFIG['img_size'], len(CONFIG['classes']))
-    
-        # Better optimizer with lower learning rate
-        optimizer = keras.optimizers.Adam(
-            learning_rate=0.0005,  # Lower learning rate
-            beta_1=0.9,
-            beta_2=0.999
-        )
-    
-        # Compile with label smoothing to prevent overconfidence
-        #self.model.compile(
-        #    optimizer=optimizer,
-        #    loss=keras.losses.CategoricalCrossentropy(label_smoothing=0.1),  # Label smoothing
-        #    metrics=['accuracy']
-        #)
-        # Replace your loss with focal loss
-        #import tensorflow_addons as tfa
+        optimizer = keras.optimizers.Adam(learning_rate=0.0005)
         self.model.compile(
             optimizer=optimizer,
-            loss=keras.losses.BinaryCrossentropy(),
+            loss=keras.losses.CategoricalCrossentropy(),
             metrics=['accuracy']
         )
-    
-        # Enhanced callbacks
+
         callbacks = [
             keras.callbacks.EarlyStopping(
-                patience=8, 
+                patience=8,
                 restore_best_weights=True,
-                monitor='val_accuracy'  # Monitor validation accuracy
+                monitor='val_accuracy'
             ),
             keras.callbacks.ReduceLROnPlateau(
-                factor=0.3, 
+                factor=0.3,
                 patience=4,
                 min_lr=1e-7,
                 monitor='val_accuracy'
-            ),
-            # Add learning rate scheduling
-            keras.callbacks.LearningRateScheduler(
-                lambda epoch: 0.0005 * (0.95 ** epoch)  # Exponential decay
             )
         ]
-    
-        # Enhanced data augmentation
-        train_datagen = self.create_traffic_light_augmentation()
-        val_datagen = ImageDataGenerator()  # No augmentation for validation
-    
-        # Create generators
+
+        train_datagen = ImageDataGenerator(
+            rotation_range=3,
+            brightness_range=[0.6, 1.4],
+            channel_shift_range=10,
+            horizontal_flip=False,
+            vertical_flip=False
+        )
+
         train_generator = train_datagen.flow(
             X_train, y_train_cat,
             batch_size=CONFIG['batch_size'],
             shuffle=True
         )
-        # Replace the standard train_generator with:
-        #train_generator = self.create_class_balanced_generator(X_train, y_train_cat, y_train)
-    
+
+        val_datagen = ImageDataGenerator()
         val_generator = val_datagen.flow(
             X_val, y_val_cat,
             batch_size=CONFIG['batch_size'],
             shuffle=False
         )
-    
-        print("Improved model architecture:")
-        self.model.summary()
-    
-        # Calculate steps
+
+        print("Training classification model...")
         steps_per_epoch = len(X_train) // CONFIG['batch_size']
         validation_steps = len(X_val) // CONFIG['batch_size']
-    
-        # Train with more epochs and better monitoring
+
         self.history = self.model.fit(
             train_generator,
             steps_per_epoch=steps_per_epoch,
-            epochs=CONFIG['epochs'],  # More epochs with early stopping
+            epochs=CONFIG['epochs'],
             validation_data=val_generator,
             validation_steps=validation_steps,
             class_weight=class_weights,
             callbacks=callbacks,
             verbose=1
         )
-    
+
         return self.history
     
-    def evaluate_model(self, X_test, y_test):
-        """Evaluate model performance"""
-         # Use manual encoding instead of label_encoder
-        y_test_encoded = self.encode_labels(y_test)
-        y_test_cat = keras.utils.to_categorical(y_test_encoded, len(self.class_to_idx))
-    
-        test_loss, test_acc = self.model.evaluate(X_test, y_test_cat, verbose=0)
-        print(f"Test accuracy: {test_acc:.4f}")
-    
-        # Get predictions
-        y_pred = self.model.predict(X_test)
-        y_pred_classes = np.argmax(y_pred, axis=1)
-    
-        # Classification report
-        from sklearn.metrics import classification_report, confusion_matrix
-        
-        print("\nClassification Report:")
-        print(classification_report(y_test_encoded, y_pred_classes, 
-                                  target_names=CONFIG['classes']))
-        
-        print("\nConfusion Matrix:")
-        cm = confusion_matrix(y_test_encoded, y_pred_classes)
-        print(cm)
-        
-        return test_acc
-    
     def convert_to_tflite(self, output_path):
-        """Convert model to TensorFlow Lite for ESP32-S3"""
-        
-        # Convert to TensorFlow Lite
+        """Convert classification model to TFLite"""
         converter = tf.lite.TFLiteConverter.from_keras_model(self.model)
-        
-        # For ESP32-S3 compatibility - avoid optimizations that cause issues
-        # converter.optimizations = [tf.lite.Optimize.DEFAULT]  # Commented out
-        
-        # Keep as float32 for better ESP32-S3 compatibility
-        #converter.target_spec.supported_types = [tf.float16]  # Commented out
-        
-        # Use only basic TFLITE operations for microcontroller compatibility
-        # converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
-        
-        # Disable experimental features that might cause issues
-        #converter.experimental_new_converter = False
-        
         tflite_model = converter.convert()
         
-        # Save the model
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         with open(output_path, 'wb') as f:
             f.write(tflite_model)
         
-        print(f"Float32 TFLite model saved to: {output_path}")
+        print(f"Classification TFLite model saved to: {output_path}")
         print(f"Model size: {len(tflite_model) / 1024:.2f} KB")
         
-        # Create a quantized version as well for comparison
-        self._create_quantized_version(output_path)
-        
         return tflite_model
-    
-    def _create_quantized_version(self, base_output_path):
-        """Create a separate quantized version for testing"""
-        quantized_path = base_output_path.replace('.tflite', '_quantized.tflite')
-        
-        try:
-            converter = tf.lite.TFLiteConverter.from_keras_model(self.model)
-            converter.optimizations = [tf.lite.Optimize.DEFAULT]
-            converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
-            
-            quantized_model = converter.convert()
-            
-            with open(quantized_path, 'wb') as f:
-                f.write(quantized_model)
-            
-            print(f"Quantized model saved to: {quantized_path}")
-            print(f"Quantized model size: {len(quantized_model) / 1024:.2f} KB")
-            
-        except Exception as e:
-            print(f"Quantized conversion failed: {e}")
-            print("Using float32 version only")
-    
-    def _representative_dataset(self):
-        """Representative dataset for quantization"""
-        # Use a subset of training data for calibration
-        for i in range(10):
-            yield [np.random.random((1,) + CONFIG['img_size'] + (3,)).astype(np.float32)]
-    
-    def plot_training_history(self):
-        """Plot training history"""
-        if self.history is None:
-            print("No training history available")
-            return
-        
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-        
-        # Plot accuracy
-        ax1.plot(self.history.history['accuracy'], label='Training Accuracy')
-        ax1.plot(self.history.history['val_accuracy'], label='Validation Accuracy')
-        ax1.set_title('Model Accuracy')
-        ax1.set_xlabel('Epoch')
-        ax1.set_ylabel('Accuracy')
-        ax1.legend()
-        
-        # Plot loss
-        ax2.plot(self.history.history['loss'], label='Training Loss')
-        ax2.plot(self.history.history['val_loss'], label='Validation Loss')
-        ax2.set_title('Model Loss')
-        ax2.set_xlabel('Epoch')
-        ax2.set_ylabel('Loss')
-        ax2.legend()
-        
-        plt.tight_layout()
-        plt.savefig(f"{CONFIG['output_dir']}/training_history.png", dpi=150, bbox_inches='tight')
-        plt.show()
 
-def preprocess_images_for_ov2640(images):
-    """Transform LISA to match OV2640 characteristics"""
-    processed = []
-    
-    for img in images:
-        img_float = img.astype(np.float32)
-        
-        # OV2640 color cast: warm shift (more red, less blue)
-        img_float[:,:,0] = np.clip(img_float[:,:,0] * 1.08, 0, 255)   # Red boost
-        img_float[:,:,2] = np.clip(img_float[:,:,2] * 0.92, 0, 255)   # Blue reduction
-        
-        # OV2640 gamma curve (nonlinear brightness)
-        img_float = np.power(img_float / 255.0, 0.95) * 255.0  # Slight gamma adjustment
-        
-        # OV2640 automatic white balance effect
-        img_hsv = cv2.cvtColor(img_float.astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
-        img_hsv[:,:,1] = np.clip(img_hsv[:,:,1] * 1.1, 0, 255)  # Saturation boost
-        img_float = cv2.cvtColor(img_hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32)
-        
-        # OV2640 sensor noise pattern (more noise in shadows)
-        noise = np.random.normal(0, 2, img_float.shape)
-        noise = noise * (img_float / 255.0)  # More noise in dark areas
-        img_float = np.clip(img_float + noise, 0, 255)
-        
-        processed.append(img_float / 255.0)
-    
-    return np.array(processed)
 
 def main():
-    """Main training pipeline"""
+    """Main training pipeline for YOLO-style detection (detection + classification in one)"""
     
-    print("=== Traffic Light Classification for ESP32-S3 ===\n")
+    print("=== Traffic Light YOLO Detection Pipeline ===")
+    print("Note: YOLO simultaneously detects AND classifies traffic lights\n")
     
-    # Create output directory
     os.makedirs(CONFIG['output_dir'], exist_ok=True)
     
-    # Initialize dataset processor
     processor = LISADatasetProcessor(CONFIG['data_dir'])
     
-    # Try to load real LISA data, otherwise use sample data
-    lisa_path = input("Enter path to LISA dataset (or press Enter to use sample data): ").strip()
-    if lisa_path and processor.load_real_lisa_data(lisa_path):
-        print("Using real LISA dataset")
-    else:
-        print("No LISA path provided")
-        return  # Salir si no hay datos LISA
-    
-    # Load images and labels
-    print("Loading images and labels...")
-    images, labels = processor.load_images_and_labels()
-    
-    if len(images) == 0:
-        print("No images found! Please check the dataset.")
+    lisa_path = input("Enter path to LISA dataset: ").strip()
+    if not lisa_path or not processor.load_real_lisa_data(lisa_path):
+        print("No LISA dataset found")
         return
     
-    print(f"Loaded {len(images)} images")
-    print(f"Classes: {np.unique(labels)}")
+    # Load YOLO detection data (includes bboxes and class labels)
+    images, bboxes, labels = processor.load_detection_data()
     
-    # Preprocess images
-    images = preprocess_images_for_ov2640(images)
+    if len(images) == 0:
+        print("No images found!")
+        return
     
-    # Split dataset
-    X_train, X_temp, y_train, y_temp = train_test_split(
-        images, labels, test_size=0.3, random_state=42, stratify=labels
+    print(f"Loaded {len(images)} images for YOLO training")
+    print(f"Classes: {np.unique(labels)} (0=red, 1=green)")
+    
+    # Split data for training
+    X_train, X_temp, bboxes_train, bboxes_temp, labels_train, labels_temp = train_test_split(
+        images, bboxes, labels, test_size=0.3, random_state=42
+    )
+    X_val, X_test, bboxes_val, bboxes_test, labels_val, labels_test = train_test_split(
+        X_temp, bboxes_temp, labels_temp, test_size=0.5, random_state=42
     )
     
-    X_val, X_test, y_val, y_test = train_test_split(
-        X_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp
-    )
-    
-    print(f"Training set: {len(X_train)} images")
+    print(f"\nTraining set: {len(X_train)} images")
     print(f"Validation set: {len(X_val)} images")
     print(f"Test set: {len(X_test)} images")
     
-    # Initialize and train model
-    model = TrafficLightModel()
+    # Train YOLO detection model
+    print("\n" + "="*50)
+    print("TRAINING YOLO DETECTION MODEL")
+    print("="*50)
     
-    print("\nTraining model...")
-    history = model.train_model(X_train, y_train, X_val, y_val)
+    yolo_model = TrafficLightDetectionModel()
+    yolo_model.train_model(X_train, bboxes_train, labels_train, 
+                          X_val, bboxes_val, labels_val)
     
-    # Evaluate model
-    print("\nEvaluating model...")
-    test_accuracy = model.evaluate_model(X_test, y_test)
+    # Evaluate on test set
+    print("\n" + "="*50)
+    print("EVALUATING YOLO MODEL ON TEST SET")
+    print("="*50)
     
-    # Plot training history
-    model.plot_training_history()
+    correct_detections = 0
+    total_detections = 0
+    detection_failures = 0
     
-    # Save Keras model
-    keras_model_path = f"{CONFIG['output_dir']}/{CONFIG['model_name']}.h5"
-    model.model.save(keras_model_path)
-    print(f"Keras model saved to: {keras_model_path}")
+    for i in range(min(100, len(X_test))):  # Test on 100 samples
+        detections = yolo_model.predict_bbox(X_test[i])
+        
+        if len(detections) > 0:
+            # Get best detection
+            best_det = max(detections, key=lambda x: x[2])
+            pred_class = best_det[1]
+            true_class = labels_test[i]
+            
+            total_detections += 1
+            if pred_class == true_class:
+                correct_detections += 1
+        else:
+            detection_failures += 1
     
-    # Convert to TensorFlow Lite
-    tflite_model_path = f"{CONFIG['output_dir']}/{CONFIG['model_name']}.tflite"
-    tflite_model = model.convert_to_tflite(tflite_model_path)
+    accuracy = correct_detections / total_detections if total_detections > 0 else 0
+    detection_rate = total_detections / (total_detections + detection_failures)
     
-    # Save label encoder
-    import pickle
-    label_encoder_path = f"{CONFIG['output_dir']}/label_encoder.pkl"
-    with open(label_encoder_path, 'wb') as f:
-        pickle.dump(model.label_encoder, f)
-    # print(f"Label encoder classes: {model.label_encoder.classes_}")
-    # Save model info
-    #model_info = {
-    #    'input_shape': CONFIG['img_size'] + (3,),
-    #    'classes': ['red', 'yellow', 'green'],  # Your desired order
-    #     'class_to_idx': {'red': 0, 'yellow': 1, 'green': 2},
-    #   'idx_to_class': {0: 'red', 1: 'yellow', 2: 'green'},
-    #    'test_accuracy': float(test_accuracy),
-    #    'model_size_kb': len(tflite_model) / 1024
-    #}
-    model_info = {
-        'input_shape': CONFIG['img_size'] + (2,),
-        'classes': ['red','green'],  # Your desired order
-        'class_to_idx': {'red': 0, 'green': 1},
-        'idx_to_class': {0: 'red', 1: 'green'},
-        'test_accuracy': float(test_accuracy),
-        'model_size_kb': len(tflite_model) / 1024
+    print(f"Detection rate: {detection_rate:.2%} ({total_detections}/{total_detections + detection_failures})")
+    print(f"Classification accuracy (when detected): {accuracy:.2%}")
+    print(f"End-to-end accuracy: {(correct_detections / (total_detections + detection_failures)):.2%}")
+    
+    # Convert to TFLite
+    yolo_tflite_path = f"{CONFIG['output_dir']}/{CONFIG['detection_model_name']}_yolo.tflite"
+    yolo_model.convert_to_tflite(yolo_tflite_path)
+    
+    # Save pipeline info
+    pipeline_info = {
+        'pipeline': 'YOLO single-stage detection + classification',
+        'model': CONFIG['detection_model_name'] + '_yolo.tflite',
+        'input_size': CONFIG['detection_img_size'],
+        'grid_size': yolo_model.grid_size,
+        'num_boxes_per_cell': yolo_model.num_boxes,
+        'classes': ['red', 'green'],
+        'class_mapping': {'0': 'red', '1': 'green'},
+        'confidence_threshold': 0.5,
+        'workflow': [
+            '1. Input full scene image (224x224)',
+            '2. Run YOLO model → get bounding boxes + class predictions',
+            '3. Apply NMS (non-maximum suppression)',
+            '4. Return detected traffic light with class and confidence',
+            '5. Audio feedback: "Red light ahead" or "Green light ahead"'
+        ],
+        'advantages': [
+            'Single model (simpler deployment)',
+            'Faster inference (one pass)',
+            'Joint optimization (detection + classification trained together)',
+            'Better real-time performance'
+        ],
+        'esp32_deployment': {
+            'model_file': CONFIG['detection_model_name'] + '_yolo.tflite',
+            'input_shape': [1] + list(CONFIG['detection_img_size']) + [3],
+            'output_shape': [1, yolo_model.grid_size, yolo_model.grid_size, 
+                           yolo_model.num_boxes, 5 + yolo_model.num_classes],
+            'preprocessing': 'Normalize to [0, 1], resize to 224x224',
+            'postprocessing': 'Decode YOLO output, apply NMS, threshold confidence'
+        },
+        'test_performance': {
+            'detection_rate': float(detection_rate),
+            'classification_accuracy_when_detected': float(accuracy),
+            'end_to_end_accuracy': float(correct_detections / (total_detections + detection_failures))
+        }
     }
     
-    with open(f"{CONFIG['output_dir']}/model_info.json", 'w') as f:
-        json.dump(model_info, f, indent=2)
+    with open(f"{CONFIG['output_dir']}/yolo_pipeline_info.json", 'w') as f:
+        json.dump(pipeline_info, f, indent=2)
     
-    print(f"\n=== Training Complete ===")
-    print(f"Test Accuracy: {test_accuracy:.4f}")
-    print(f"Model Size: {len(tflite_model) / 1024:.2f} KB")
-    print(f"Files saved in: {CONFIG['output_dir']}/")
+    print(f"\n=== YOLO Pipeline Training Complete ===")
+    print(f"Model: {yolo_tflite_path}")
+    print(f"Pipeline info: {CONFIG['output_dir']}/yolo_pipeline_info.json")
+    print(f"\nThis single model both DETECTS and CLASSIFIES traffic lights!")
+    print(f"Much simpler than two-stage approach for embedded deployment.")
     
-    # ESP32-S3 deployment instructions
-    print("\n=== ESP32-S3 Deployment Instructions ===")
-    print("1. Copy the .tflite file to your ESP32-S3 project")
-    print("2. Use TensorFlow Lite for Microcontrollers library")
-    print("3. Input image size: 96x96x3")
-    print("4. Classes: red=0, yellow=1, green=2")
-    print("5. Normalize input images to [0, 1] range")
+    # Visualize some predictions
+    visualize_yolo_predictions(yolo_model, X_test[:5], labels_test[:5])
 
-def test_tflite_model():
-    """Test the converted TensorFlow Lite model"""
+
+def visualize_yolo_predictions(model, images, true_labels):
+    """Visualize YOLO predictions on sample images"""
     
-    tflite_model_path = f"{CONFIG['output_dir']}/{CONFIG['model_name']}.tflite"
+    class_names = ['red', 'green']
     
-    if not os.path.exists(tflite_model_path):
-        print("TensorFlow Lite model not found!")
-        return
+    fig, axes = plt.subplots(1, min(5, len(images)), figsize=(15, 3))
+    if len(images) == 1:
+        axes = [axes]
     
-    # Load TFLite model
-    interpreter = tf.lite.Interpreter(model_path=tflite_model_path)
-    interpreter.allocate_tensors()
+    for i, (img, true_label) in enumerate(zip(images[:5], true_labels[:5])):
+        detections = model.predict_bbox(img)
+        
+        # Display image
+        axes[i].imshow(img)
+        axes[i].axis('off')
+        
+        if len(detections) > 0:
+            # Draw best detection
+            best_det = max(detections, key=lambda x: x[2])
+            bbox, pred_class, confidence = best_det
+            
+            # Draw bounding box
+            rect = plt.Rectangle(
+                (bbox[0], bbox[1]), 
+                bbox[2] - bbox[0], 
+                bbox[3] - bbox[1],
+                fill=False, 
+                color='lime' if pred_class == true_label else 'red',
+                linewidth=2
+            )
+            axes[i].add_patch(rect)
+            
+            # Add label
+            label_text = f"{class_names[pred_class]} {confidence:.2f}"
+            axes[i].text(bbox[0], bbox[1] - 5, label_text, 
+                        color='white', fontsize=8,
+                        bbox=dict(boxstyle='round', facecolor='green' if pred_class == true_label else 'red', alpha=0.7))
+            
+            title = f"True: {class_names[true_label]}\nPred: {class_names[pred_class]}"
+        else:
+            title = f"True: {class_names[true_label]}\nNo detection"
+        
+        axes[i].set_title(title, fontsize=8)
     
-    # Get input and output details
-    input_details = interpreter.get_input_details()
-    output_details = interpreter.get_output_details()
-    
-    print("TensorFlow Lite Model Info:")
-    print(f"Input shape: {input_details[0]['shape']}")
-    print(f"Output shape: {output_details[0]['shape']}")
-    
-    # Test with random input
-    test_input = np.random.random(input_details[0]['shape']).astype(np.float32)
-    
-    interpreter.set_tensor(input_details[0]['index'], test_input)
-    interpreter.invoke()
-    
-    output = interpreter.get_tensor(output_details[0]['index'])
-    predicted_class = np.argmax(output[0])
-    confidence = output[0][predicted_class]
-    
-    print(f"Test prediction: Class {predicted_class} ({CONFIG['classes'][predicted_class]}) with confidence {confidence:.4f}")
+    plt.tight_layout()
+    plt.savefig(f"{CONFIG['output_dir']}/yolo_predictions.png", dpi=150, bbox_inches='tight')
+    print(f"\nSample predictions saved to: {CONFIG['output_dir']}/yolo_predictions.png")
+    plt.show()
+
 
 if __name__ == "__main__":
     main()
-    
-    # Test the TFLite model
-    print("\nTesting TensorFlow Lite model...")
-    test_tflite_model()
