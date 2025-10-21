@@ -649,7 +649,7 @@ class LISADatasetProcessor:
             print(f"  {cls}: {count:,}")
 
         # PASO 2: Sampling balanceado por clase - reducido para full scenes
-        target_samples_per_class = 2000  # Reducido porque full scenes son más informativos
+        target_samples_per_class = 5000  # Reducido porque full scenes son más informativos
 
         # Group annotations by image to avoid duplicates per image
         image_to_annotations = {}
@@ -1338,46 +1338,33 @@ class TrafficLightModel:
         plt.savefig(f"{CONFIG['output_dir']}/training_history.png", dpi=150, bbox_inches='tight')
         plt.show()
 
-def preprocess_images(images):
-    processed_images = []
+def preprocess_images_for_ov2640(images):
+    """Transform LISA to match OV2640 characteristics"""
+    processed = []
     
     for img in images:
-        # Convert to HSV
-        #img_hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV).astype(np.float32)
+        img_float = img.astype(np.float32)
         
-        # AGGRESSIVE saturation boost
-        #img_hsv[:, :, 1] = np.clip(img_hsv[:, :, 1] * 1.8, 0, 255)  # 2.0x not 1.8x
+        # OV2640 color cast: warm shift (more red, less blue)
+        img_float[:,:,0] = np.clip(img_float[:,:,0] * 1.08, 0, 255)   # Red boost
+        img_float[:,:,2] = np.clip(img_float[:,:,2] * 0.92, 0, 255)   # Blue reduction
         
-        # Value enhancement
-        #img_hsv[:, :, 2] = np.clip(img_hsv[:, :, 2] * 1.2, 0, 255)
+        # OV2640 gamma curve (nonlinear brightness)
+        img_float = np.power(img_float / 255.0, 0.95) * 255.0  # Slight gamma adjustment
         
-        #img_enhanced = cv2.cvtColor(img_hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+        # OV2640 automatic white balance effect
+        img_hsv = cv2.cvtColor(img_float.astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
+        img_hsv[:,:,1] = np.clip(img_hsv[:,:,1] * 1.1, 0, 255)  # Saturation boost
+        img_float = cv2.cvtColor(img_hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32)
         
-        # RED-SPECIFIC boost
-        # Find red-ish pixels and enhance them
-        #red_mask = (img_enhanced[:,:,0] > 100) & (img_enhanced[:,:,0] > img_enhanced[:,:,1] * 1.2)
-        #img_enhanced[:,:,0][red_mask] = np.clip(img_enhanced[:,:,0][red_mask] * 1.3, 0, 255)
+        # OV2640 sensor noise pattern (more noise in shadows)
+        noise = np.random.normal(0, 2, img_float.shape)
+        noise = noise * (img_float / 255.0)  # More noise in dark areas
+        img_float = np.clip(img_float + noise, 0, 255)
         
-        # Contrast
-        #img_enhanced = np.clip(img_enhanced * 1.15, 0, 255).astype(np.uint8)
-        
-        #processed_images.append(img_enhanced)
-        #alternative
-        # Convert to HSV
-        img_hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV).astype(np.float32)
-        
-        # Aggressive saturation boost for color separation
-        img_hsv[:, :, 1] = np.clip(img_hsv[:, :, 1] * 1.05, 0, 255)
-        
-        # Value enhancement
-        img_hsv[:, :, 2] = np.clip(img_hsv[:, :, 2] * 1.05, 0, 255)
-        
-        img_enhanced = cv2.cvtColor(img_hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
-        
-        processed_images.append(img_enhanced)
+        processed.append(img_float / 255.0)
     
-    return np.array(processed_images, dtype=np.float32) / 255.0
-    return np.array(processed_images, dtype=np.float32) / 255.0
+    return np.array(processed)
 
 def main():
     """Main training pipeline"""
@@ -1410,7 +1397,7 @@ def main():
     print(f"Classes: {np.unique(labels)}")
     
     # Preprocess images
-    images = preprocess_images(images)
+    images = preprocess_images_for_ov2640(images)
     
     # Split dataset
     X_train, X_temp, y_train, y_temp = train_test_split(
